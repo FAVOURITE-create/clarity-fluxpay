@@ -10,14 +10,21 @@
 (define-constant err-subscription-not-found (err u105))
 (define-constant err-refund-not-allowed (err u106))
 (define-constant err-invalid-status (err u107))
+(define-constant err-contract-paused (err u108))
+(define-constant err-amount-too-large (err u109))
+
+;; Constants for amount limits
+(define-constant maximum-payment-amount u1000000000000) ;; 1M STX
+(define-constant minimum-payment-amount u1000) ;; 0.001 STX
 
 ;; Data Variables
 (define-data-var gateway-fee uint u10) ;; 1% default fee
 (define-data-var total-transactions uint u0)
 (define-data-var total-subscriptions uint u0)
 (define-data-var total-refunds uint u0)
+(define-data-var contract-paused bool false)
 
-;; Data Maps
+;; Enhanced payments map with metadata
 (define-map payments
     { payment-id: uint }
     {
@@ -27,23 +34,29 @@
         status: (string-ascii 20),
         timestamp: uint,
         payment-type: (string-ascii 20),
-        refunded: bool
+        refunded: bool,
+        metadata: (optional (string-ascii 256))
     }
 )
 
-(define-map refunds
-    { refund-id: uint }
-    {
-        payment-id: uint,
-        amount: uint,
-        timestamp: uint,
-        status: (string-ascii 20)
-    }
+;; Payment status tracking
+(define-map payment-status-transitions
+    { current: (string-ascii 20) }
+    { allowed: (list 10 (string-ascii 20)) }
 )
 
-;; Rest of the existing maps...
+;; Initialize status transitions
+(map-set payment-status-transitions
+    { current: "pending" }
+    { allowed: (list "completed" "failed" "expired") }
+)
 
-;; Private Functions
+(map-set payment-status-transitions
+    { current: "completed" }
+    { allowed: (list "refunded") }
+)
+
+;; Enhanced Private Functions
 (define-private (validate-payment-status (payment-id uint) (expected-status (string-ascii 20)))
     (match (map-get? payments { payment-id: payment-id })
         payment (is-eq (get status payment) expected-status)
@@ -51,80 +64,63 @@
     )
 )
 
-;; Enhanced process-payment function
-(define-public (process-payment (recipient principal) (amount uint))
-    (let
-        (
-            (payment-id (var-get total-transactions))
-            (fee (calculate-fee amount))
-            (final-amount (- amount fee))
-        )
-        (if (> amount u0)
-            (begin
-                (try! (stx-transfer? final-amount tx-sender recipient))
-                (try! (stx-transfer? fee tx-sender contract-owner))
-                (map-set payments
-                    { payment-id: payment-id }
-                    {
-                        sender: tx-sender,
-                        recipient: recipient,
-                        amount: amount,
-                        status: "completed",
-                        timestamp: block-height,
-                        payment-type: "one-time",
-                        refunded: false
-                    }
-                )
-                (var-set total-transactions (+ payment-id u1))
-                (ok payment-id)
-            )
-            err-invalid-amount
-        )
+(define-private (validate-amount (amount uint))
+    (and
+        (>= amount minimum-payment-amount)
+        (<= amount maximum-payment-amount)
     )
 )
 
-;; New refund functionality
-(define-public (refund-payment (payment-id uint))
-    (match (map-get? payments { payment-id: payment-id })
-        payment
+(define-private (calculate-fee (amount uint))
+    (/ (* amount (var-get gateway-fee)) u1000)
+)
+
+;; Admin Functions
+(define-public (toggle-contract-pause)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (var-set contract-paused (not (var-get contract-paused))))
+    )
+)
+
+;; Enhanced process-payment function
+(define-public (process-payment 
+    (recipient principal) 
+    (amount uint)
+    (metadata (optional (string-ascii 256))))
+    (begin
+        (asserts! (not (var-get contract-paused)) err-contract-paused)
+        (asserts! (validate-amount amount) err-invalid-amount)
         (let
             (
-                (refund-id (var-get total-refunds))
-                (amount (get amount payment))
-                (recipient (get recipient payment))
-                (sender (get sender payment))
+                (payment-id (var-get total-transactions))
+                (fee (calculate-fee amount))
+                (final-amount (- amount fee))
             )
-            (asserts! (validate-payment-status payment-id "completed") err-invalid-status)
-            (asserts! (not (get refunded payment)) err-refund-not-allowed)
-            (begin
-                (try! (stx-transfer? amount recipient sender))
-                (map-set payments
-                    { payment-id: payment-id }
-                    (merge payment { 
-                        status: "refunded",
-                        refunded: true
-                    })
+            (if (> amount u0)
+                (begin
+                    (try! (stx-transfer? final-amount tx-sender recipient))
+                    (try! (stx-transfer? fee tx-sender contract-owner))
+                    (map-set payments
+                        { payment-id: payment-id }
+                        {
+                            sender: tx-sender,
+                            recipient: recipient,
+                            amount: amount,
+                            status: "completed",
+                            timestamp: block-height,
+                            payment-type: "one-time",
+                            refunded: false,
+                            metadata: metadata
+                        }
+                    )
+                    (var-set total-transactions (+ payment-id u1))
+                    (ok payment-id)
                 )
-                (map-set refunds
-                    { refund-id: refund-id }
-                    {
-                        payment-id: payment-id,
-                        amount: amount,
-                        timestamp: block-height,
-                        status: "completed"
-                    }
-                )
-                (var-set total-refunds (+ refund-id u1))
-                (ok refund-id)
+                err-invalid-amount
             )
         )
-        err-payment-not-found
     )
-)
-
-;; New read-only functions
-(define-read-only (get-refund-details (refund-id uint))
-    (ok (map-get? refunds { refund-id: refund-id }))
 )
 
 ;; Rest of the existing contract code...
